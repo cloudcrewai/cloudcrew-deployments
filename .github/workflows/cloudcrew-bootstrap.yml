@@ -1,0 +1,116 @@
+name: CloudCrew AI — Bootstrap State Backend
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    name: Bootstrap Terraform State Backend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create bootstrap workspace
+        run: |
+          mkdir -p /tmp/bootstrap
+          cat > /tmp/bootstrap/bootstrap.tf << 'HCL'
+          terraform {
+            required_providers {
+              aws = {
+                source  = "hashicorp/aws"
+                version = "~> 6.0"
+              }
+            }
+          }
+
+          provider "aws" {
+            region = var.region
+          }
+
+          variable "region" {
+            default = "us-east-1"
+          }
+
+          data "aws_caller_identity" "current" {}
+
+          locals {
+            bucket_name = "cloudcrew-tf-state-${data.aws_caller_identity.current.account_id}"
+            table_name  = "cloudcrew-tf-locks-${data.aws_caller_identity.current.account_id}"
+          }
+
+          resource "aws_s3_bucket" "tf_state" {
+            bucket = local.bucket_name
+            tags = {
+              Environment = "production"
+              ManagedBy   = "CloudCrew AI"
+            }
+          }
+
+          resource "aws_s3_bucket_versioning" "tf_state" {
+            bucket = aws_s3_bucket.tf_state.id
+            versioning_configuration {
+              status = "Enabled"
+            }
+          }
+
+          resource "aws_s3_bucket_server_side_encryption_configuration" "tf_state" {
+            bucket = aws_s3_bucket.tf_state.id
+            rule {
+              apply_server_side_encryption_by_default {
+                sse_algorithm = "AES256"
+              }
+            }
+          }
+
+          resource "aws_dynamodb_table" "tf_locks" {
+            name         = local.table_name
+            billing_mode = "PAY_PER_REQUEST"
+            hash_key     = "LockID"
+            attribute {
+              name = "LockID"
+              type = "S"
+            }
+            tags = {
+              Environment = "production"
+              ManagedBy   = "CloudCrew AI"
+            }
+          }
+          HCL
+
+      - name: Terraform Init (local state — no backend yet)
+        working-directory: /tmp/bootstrap
+        run: terraform init -backend=false
+
+      - name: Bootstrap State Resources
+        working-directory: /tmp/bootstrap
+        run: terraform apply -auto-approve -input=false
+
+      - name: Publish backend location as repo variables
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="cloudcrew-tf-state-${ACCOUNT}"
+          TABLE="cloudcrew-tf-locks-${ACCOUNT}"
+          # cloudcrew-deploy.yml reads these as -backend-config/TF_VAR_tf_state_bucket —
+          # this is the ONLY place they are ever written, under the customer's own
+          # credentials, into the customer's own repo (not CloudCrew's account or database).
+          gh variable set CLOUDCREW_TF_STATE_BUCKET --body "$BUCKET"
+          gh variable set CLOUDCREW_TF_LOCK_TABLE --body "$TABLE"
+          echo "Published CLOUDCREW_TF_STATE_BUCKET=$BUCKET CLOUDCREW_TF_LOCK_TABLE=$TABLE"
