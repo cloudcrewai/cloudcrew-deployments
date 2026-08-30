@@ -1,0 +1,198 @@
+name: CloudCrew AI — Deploy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy (e.g. cloudcrew-abc12345)'
+        required: true
+        type: string
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+  CLOUDCREW_DEPLOY_ROLE_ARN: ${{ secrets.CLOUDCREW_DEPLOY_ROLE_ARN }}
+  # Set by cloudcrew-bootstrap.yml's "Publish backend location" step, under the
+  # customer's own credentials. Empty until that workflow has been run once —
+  # deliberately: an empty -backend-config/TF_VAR_tf_state_bucket fails init loudly
+  # rather than falling back to any default (BL-STATE-TENANCY-01).
+  CLOUDCREW_TF_STATE_BUCKET: ${{ vars.CLOUDCREW_TF_STATE_BUCKET }}
+  CLOUDCREW_TF_LOCK_TABLE: ${{ vars.CLOUDCREW_TF_LOCK_TABLE }}
+  TF_VAR_tf_state_bucket: ${{ vars.CLOUDCREW_TF_STATE_BUCKET }}
+
+jobs:
+  terraform:
+    name: Terraform ${{ github.event_name == 'pull_request' && 'Plan' || github.event.inputs.action }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref }}
+
+      - name: Configure AWS credentials (OIDC)
+        if: env.CLOUDCREW_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CLOUDCREW_DEPLOY_ROLE_ARN }}
+          role-session-name: cloudcrew-${{ github.run_id }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Configure AWS credentials (static keys)
+        if: env.CLOUDCREW_DEPLOY_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Check no bootstrap.tf in PR
+        if: github.event_name == 'pull_request'
+        run: |
+          if find terraform -name 'bootstrap.tf' 2>/dev/null | grep -q .; then
+            echo "ERROR: bootstrap.tf found — must never be in customer repos"
+            exit 1
+          fi
+          echo "bootstrap.tf check passed"
+
+      - name: Check state backend is bootstrapped
+        run: |
+          if [ -z "${CLOUDCREW_TF_STATE_BUCKET}" ]; then
+            echo "ERROR: CLOUDCREW_TF_STATE_BUCKET is not set."
+            echo "Run the 'CloudCrew AI — Bootstrap State Backend' workflow "
+            echo "(cloudcrew-bootstrap.yml, workflow_dispatch) once for this repo first —"
+            echo "it creates your account's state bucket/lock table and publishes their"
+            echo "names as repo variables this workflow reads."
+            exit 1
+          fi
+          echo "State backend: bucket=${CLOUDCREW_TF_STATE_BUCKET} table=${CLOUDCREW_TF_LOCK_TABLE}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.9
+
+      - name: Detect Terraform layout
+        id: layout
+        run: |
+          phase_dirs=$(find terraform -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9]-*' 2>/dev/null | sort)
+          if [ -n "$phase_dirs" ]; then
+            echo "chunked=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' $phase_dirs > /tmp/phase_dirs.txt
+          else
+            echo "chunked=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read backend config
+        if: steps.layout.outputs.chunked == 'true'
+        run: |
+          set -euo pipefail
+          FIRST_DIR=$(head -1 /tmp/phase_dirs.txt)
+          # bucket/dynamodb_table are no longer in backend.tf (BL-STATE-TENANCY-01) —
+          # CLOUDCREW_TF_STATE_BUCKET/CLOUDCREW_TF_LOCK_TABLE (top-level env:, from repo
+          # variables) are the source now. Only the key prefix still comes from backend.tf,
+          # since key/region/encrypt are still literal there.
+          RAW_KEY=$(grep -E '^\s+key\s+=' "$FIRST_DIR/backend.tf" | head -1 | awk -F'"' '{print $2}')
+          PREFIX=$(echo "$RAW_KEY" | sed 's|/[^/]*/terraform\.tfstate.*||')
+          echo "TF_STATE_PREFIX=$PREFIX" >> $GITHUB_ENV
+          echo "Backend: bucket=${CLOUDCREW_TF_STATE_BUCKET} table=${CLOUDCREW_TF_LOCK_TABLE} prefix=$PREFIX"
+
+      - name: Clear DynamoDB state checksums
+        if: steps.layout.outputs.chunked == 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            PHASE=$(basename "$dir")
+            KEY="${{ env.CLOUDCREW_TF_STATE_BUCKET }}/${{ env.TF_STATE_PREFIX }}/${PHASE}/terraform.tfstate-md5"
+            echo "Clearing DynamoDB checksum: $KEY"
+            aws dynamodb delete-item \
+              --table-name "${{ env.CLOUDCREW_TF_LOCK_TABLE }}" \
+              --key "{\"LockID\": {\"S\": \"$KEY\"}}" \
+              --region "${{ env.AWS_DEFAULT_REGION }}" 2>/dev/null || true
+          done < /tmp/phase_dirs.txt
+          echo "DynamoDB checksums cleared"
+
+      # ── Validate (provider schema check) ─────────────────────────────────
+      - name: Terraform Validate — chunked phases
+        if: steps.layout.outputs.chunked == 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            echo "=== Validating: $dir ==="
+            terraform -chdir="$dir" init -backend=false -input=false -no-color
+            terraform -chdir="$dir" validate -no-color
+          done < /tmp/phase_dirs.txt
+
+      - name: Terraform Validate — flat
+        if: steps.layout.outputs.chunked == 'false'
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false -no-color
+          terraform -chdir=terraform validate -no-color
+
+      # ── Flat layout (terraform/) ─────────────────────────────────────────
+      - name: Terraform Init (flat)
+        if: steps.layout.outputs.chunked == 'false'
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${CLOUDCREW_TF_STATE_BUCKET}" \
+            -backend-config="dynamodb_table=${CLOUDCREW_TF_LOCK_TABLE}"
+
+      - name: Terraform Plan (flat)
+        if: steps.layout.outputs.chunked == 'false' && github.event_name == 'pull_request'
+        working-directory: terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply (flat)
+        if: steps.layout.outputs.chunked == 'false' && github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
+        working-directory: terraform
+        run: terraform apply -auto-approve -input=false
+
+      - name: Terraform Destroy (flat)
+        if: steps.layout.outputs.chunked == 'false' && github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        working-directory: terraform
+        run: terraform destroy -auto-approve
+
+      # ── Chunked layout (01-networking → 02-data → 03-compute) ───────────
+      - name: Terraform Plan — chunked phases (forward)
+        if: steps.layout.outputs.chunked == 'true' && github.event_name == 'pull_request'
+        run: |
+          while IFS= read -r dir; do
+            echo "=== Init + Plan: $dir ==="
+            terraform -chdir="$dir" init \
+              -backend-config="bucket=${CLOUDCREW_TF_STATE_BUCKET}" \
+              -backend-config="dynamodb_table=${CLOUDCREW_TF_LOCK_TABLE}"
+            terraform -chdir="$dir" plan -out=tfplan
+          done < /tmp/phase_dirs.txt
+
+      - name: Terraform Apply — chunked phases (forward)
+        if: steps.layout.outputs.chunked == 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
+        run: |
+          while IFS= read -r dir; do
+            echo "=== Apply: $dir ==="
+            terraform -chdir="$dir" init -input=false \
+              -backend-config="bucket=${CLOUDCREW_TF_STATE_BUCKET}" \
+              -backend-config="dynamodb_table=${CLOUDCREW_TF_LOCK_TABLE}"
+            terraform -chdir="$dir" apply -auto-approve -input=false
+          done < /tmp/phase_dirs.txt
+
+      - name: Terraform Destroy — chunked phases (reverse)
+        if: steps.layout.outputs.chunked == 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        run: |
+          while IFS= read -r dir; do
+            echo "=== Init + Destroy: $dir ==="
+            terraform -chdir="$dir" init \
+              -backend-config="bucket=${CLOUDCREW_TF_STATE_BUCKET}" \
+              -backend-config="dynamodb_table=${CLOUDCREW_TF_LOCK_TABLE}"
+            terraform -chdir="$dir" destroy -auto-approve
+          done < <(sort -r /tmp/phase_dirs.txt)
