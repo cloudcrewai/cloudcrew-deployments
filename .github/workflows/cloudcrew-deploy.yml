@@ -102,7 +102,15 @@ jobs:
           # CLOUDCREW_TF_STATE_BUCKET/CLOUDCREW_TF_LOCK_TABLE (top-level env:, from repo
           # variables) are the source now. Only the key prefix still comes from backend.tf,
           # since key/region/encrypt are still literal there.
-          RAW_KEY=$(grep -E '^\s+key\s+=' "$FIRST_DIR/backend.tf" | head -1 | awk -F'"' '{print $2}')
+          if [ ! -f "$FIRST_DIR/backend.tf" ]; then
+            echo "ERROR: $FIRST_DIR/backend.tf not found — cannot read the state key prefix."
+            exit 1
+          fi
+          RAW_KEY=$(grep -E '^\s+key\s+=' "$FIRST_DIR/backend.tf" | head -1 | awk -F'"' '{print $2}' || true)
+          if [ -z "$RAW_KEY" ]; then
+            echo "ERROR: no 'key' line found in $FIRST_DIR/backend.tf — cannot derive TF_STATE_PREFIX."
+            exit 1
+          fi
           PREFIX=$(echo "$RAW_KEY" | sed 's|/[^/]*/terraform\.tfstate.*||')
           echo "TF_STATE_PREFIX=$PREFIX" >> $GITHUB_ENV
           echo "Backend: bucket=${CLOUDCREW_TF_STATE_BUCKET} table=${CLOUDCREW_TF_LOCK_TABLE} prefix=$PREFIX"
