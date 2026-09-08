@@ -1,0 +1,7 @@
+terraform {
+  backend "s3" {
+    key     = "hipaa-data-platform/production/02-data/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
+  }
+}
