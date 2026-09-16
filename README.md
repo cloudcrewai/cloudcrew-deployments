@@ -1,1 +1,128 @@
-# cloudcrew-deployments
+# Production IoT Data Pipeline
+
+Production-grade IoT data pipeline in us-east-1 across 2 Availability Zones. Devices connect through AWS IoT Core, routing telemetry to Kinesis Data Streams for real-time processing and S3 for archival. A Lambda function processes the stream and writes aggregates to DynamoDB and time-series metrics to Timestream. VPC endpoints ensure traffic stays within the VPC. KMS encrypts data, and CloudWatch monitors the pipeline.
+
+![CloudCrew AI](https://img.shields.io/badge/Generated%20By-CloudCrew%20AI-02C39A)
+![IaC Engine](https://img.shields.io/badge/IaC-Terraform%20%2B%20Pulumi-blue)
+![Region](https://img.shields.io/badge/Region-us-east-1-orange)
+
+## Architecture
+
+📐 [View Architecture Diagram](https://github.com/cloudcrewai/cloudcrew-deployments/blob/cloudcrew-3044df3e/docs/architecture.png)
+
+## Overview
+
+| Property | Value |
+|---|---|
+| Project | `iot-data-pipeline` |
+| Environment | `production` |
+| Region | `us-east-1` |
+| IaC Engine | Terraform + Pulumi |
+| Availability Zones | 2 |
+| Estimated Monthly Cost | $83.70 |
+| Session ID | `3044df3e-0d50-4932-a5b2-bd06eed7091f` |
+
+## Components
+
+| Component | Type | Description |
+|---|---|---|
+| IoT VPC | `vpc` |  |
+| Internet Gateway | `internet gateway` |  |
+| NAT Gateway AZ-A | `nat gateway` |  |
+| NAT Gateway AZ-B | `nat gateway` |  |
+| Public Subnet AZ-A | `public subnet` |  |
+| Public Subnet AZ-B | `public subnet` |  |
+| Private Subnet AZ-A | `private subnet` |  |
+| Private Subnet AZ-B | `private subnet` |  |
+| AWS IoT Core | `iot core` |  |
+| Kinesis Data Stream | `kinesis data stream` |  |
+| S3 Archival Bucket | `s3` |  |
+| Stream Processor Lambda | `lambda` |  |
+| DynamoDB Aggregates | `dynamodb` |  |
+| Timestream Metrics DB | `timestream` |  |
+| CloudWatch Monitoring | `cloudwatch` |  |
+| KMS Customer Managed Key | `kms` |  |
+
+## Cost Breakdown
+
+| Service | Monthly Cost |
+|---|---|
+| nat gateway | $32.85 |
+| nat gateway | $32.85 |
+| lambda | $17.00 |
+| kms | $1.00 |
+| **Total** | **$83.70** |
+
+## Security
+
+Shield scan: **✅ PASSED**
+- Critical: 0 | High: 0 | Medium: 22 | Low: 8
+
+## Deployment
+
+> ⚠️ **Always review the plan before applying.** Run `terraform plan` and read the
+> output before `terraform apply`. Prefer your CI/CD pipeline with approval gates for production.
+
+### Step 1 — Bootstrap the Terraform state backend (once per AWS account)
+
+State is stored in S3 with DynamoDB locking, in **your own** AWS account. Run the
+`CloudCrew AI — Bootstrap State Backend` workflow once, from the Actions tab of this
+repo (`workflow_dispatch`, no inputs needed). It creates the bucket/lock table under
+*your* credentials and publishes their names as repo variables the deploy workflow
+below reads — running it manually via the AWS CLI instead will create the same
+resources but will NOT publish those variables, and the deploy workflow will refuse
+to run without them.
+
+### Step 2 — Apply in phase order
+
+This deployment uses a 3-phase structure. **Apply phases in order** — each
+phase consumes outputs (via remote state) from the previous one.
+
+**Phase: Networking**
+```bash
+cd terraform/01-networking
+terraform init
+terraform plan -out=tfplan
+terraform apply tfplan
+cd ../..
+```
+
+**Phase: Data**
+```bash
+cd terraform/02-data
+terraform init
+terraform plan -out=tfplan
+terraform apply tfplan
+cd ../..
+```
+
+**Phase: Compute**
+```bash
+cd terraform/03-compute
+terraform init
+terraform plan -out=tfplan
+terraform apply tfplan
+cd ../..
+```
+
+## Documentation
+
+| Document | Description |
+|---|---|
+| [Architecture Diagram](docs/architecture.png) | Visual architecture overview |
+| [Rollback Guide](docs/rollback.md) | Step-by-step rollback instructions |
+| [Primary Compute Platform Selection](docs/adr/ADR-001-primary-compute-platform-selection.md) | Architecture Decision Record |
+| [Database Engine Selection](docs/adr/ADR-002-database-engine-selection.md) | Architecture Decision Record |
+| [Network Topology Design](docs/adr/ADR-003-network-topology-design.md) | Architecture Decision Record |
+| [Security Posture](docs/adr/ADR-004-security-posture.md) | Architecture Decision Record |
+| [Cost Optimisation Strategy](docs/adr/ADR-005-cost-optimisation-strategy.md) | Architecture Decision Record |
+| [IoT VPC](docs/runbooks/RUNBOOK-OPS-001-iot-vpc.md) | Operational Runbook |
+| [NAT Gateway AZ-A](docs/runbooks/RUNBOOK-OPS-002-nat-gateway-az-a.md) | Operational Runbook |
+| [NAT Gateway AZ-B](docs/runbooks/RUNBOOK-OPS-003-nat-gateway-az-b.md) | Operational Runbook |
+| [Public Subnet AZ-A](docs/runbooks/RUNBOOK-OPS-004-public-subnet-az-a.md) | Operational Runbook |
+| [Public Subnet AZ-B](docs/runbooks/RUNBOOK-OPS-005-public-subnet-az-b.md) | Operational Runbook |
+| [Private Subnet AZ-A](docs/runbooks/RUNBOOK-OPS-006-private-subnet-az-a.md) | Operational Runbook |
+| [Private Subnet AZ-B](docs/runbooks/RUNBOOK-OPS-007-private-subnet-az-b.md) | Operational Runbook |
+
+---
+*Generated by [CloudCrew AI](https://cloudcrewai.com) — Session `3044df3e-0d50-4932-a5b2-bd06eed7091f`*
